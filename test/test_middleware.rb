@@ -42,22 +42,25 @@ class StackProf::MiddlewareTest < MiniTest::Test
     env = {}
 
     StackProf::Middleware.new(Object.new, enabled: Proc.new{ false })
-    refute StackProf::Middleware.enabled?(env)
+    refute StackProf::Middleware.enabled?
 
     StackProf::Middleware.new(Object.new, enabled: Proc.new{ true })
-    assert StackProf::Middleware.enabled?(env)
+    assert StackProf::Middleware.enabled?
   end
 
-  def test_enabled_should_use_a_proc_if_passed_and_use_the_request_env
-    enable_proc = Proc.new {|env| env['PROFILE'] }
-
-    env = Hash.new { false }
-    StackProf::Middleware.new(Object.new, enabled: enable_proc)
-    refute StackProf::Middleware.enabled?(env)
-
+  def test_enabled_should_override_mode_if_a_proc
+    proc_called = false
+    middleware = StackProf::Middleware.new(proc {|env| proc_called = true}, enabled: Proc.new{ [true, 'foo'] })
     env = Hash.new { true }
-    StackProf::Middleware.new(Object.new, enabled: enable_proc)
-    assert StackProf::Middleware.enabled?(env)
+    enabled, mode = StackProf::Middleware.enabled?
+    assert enabled
+    assert_equal 'foo', mode
+
+    StackProf.expects(:start).with({mode: 'foo', interval: StackProf::Middleware.interval, raw: false})
+    StackProf.expects(:stop)
+
+    middleware.call(nil)
+    assert proc_called
   end
 
   def test_raw

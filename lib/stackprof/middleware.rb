@@ -16,8 +16,8 @@ module StackProf
     end
 
     def call(env)
-      enabled = Middleware.enabled?(env)
-      StackProf.start(mode: Middleware.mode, interval: Middleware.interval, raw: Middleware.raw) if enabled
+      enabled, mode = Middleware.enabled?
+      StackProf.start(mode: mode || Middleware.mode, raw: Middleware.raw, interval: Middleware.interval) if enabled
       @app.call(env)
     ensure
       if enabled
@@ -32,9 +32,9 @@ module StackProf
     class << self
       attr_accessor :enabled, :mode, :interval, :raw, :path
 
-      def enabled?(env)
+      def enabled?
         if enabled.respond_to?(:call)
-          enabled.call(env)
+          enabled.call
         else
           enabled
         end
