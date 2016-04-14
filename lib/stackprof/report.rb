@@ -15,13 +15,16 @@ module StackProf
     def normalized_frames
       id2hash = {}
       @data[:frames].each do |frame, info|
-        id2hash[frame.to_s] = info[:hash] = Digest::MD5.hexdigest("#{info[:name]}#{info[:file]}#{info[:line]}")
+        # flamegraph likes the frames to be numbers, so md5.to_i(16)
+        id2hash[frame.to_s] = info[:hash] = Digest::MD5.hexdigest("#{info[:name]}#{info[:file]}#{info[:line]}").to_i(16)
       end
-      @data[:frames].inject(Hash.new) do |hash, (frame, info)|
+      # include raw also
+      raw_frames = @data[:raw].map {|v| id2hash[v.to_s] || v } if @data[:raw]
+      return @data[:frames].inject(Hash.new) do |hash, (frame, info)|
         info = hash[id2hash[frame.to_s]] = info.dup
         info[:edges] = info[:edges].inject(Hash.new){ |edges, (edge, weight)| edges[id2hash[edge.to_s]] = weight; edges } if info[:edges]
         hash
-      end
+      end, raw_frames || []
     end
 
     def version
@@ -311,7 +314,8 @@ module StackProf
       raise ArgumentError, "cannot combine #{modeline} with #{other.modeline}" unless modeline == other.modeline
       raise ArgumentError, "cannot combine v#{version} with v#{other.version}" unless version == other.version
 
-      f1, f2 = normalized_frames, other.normalized_frames
+      f1, raw_frames1 = normalized_frames
+      f2, raw_frames2 = other.normalized_frames
       frames = (f1.keys + f2.keys).uniq.inject(Hash.new) do |hash, id|
         if f1[id].nil?
           hash[id] = f2[id]
@@ -346,7 +350,8 @@ module StackProf
         samples: d1[:samples] + d2[:samples],
         gc_samples: d1[:gc_samples] + d2[:gc_samples],
         missed_samples: d1[:missed_samples] + d2[:missed_samples],
-        frames: frames
+        frames: frames,
+        raw: raw_frames1 + raw_frames2
       }
 
       self.class.new(data)
