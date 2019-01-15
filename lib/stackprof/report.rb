@@ -9,7 +9,8 @@ module StackProf
     attr_reader :data
 
     def frames(sort_by_total=false)
-      @data[:frames].sort_by{ |iseq, stats| -stats[sort_by_total ? :total_samples : :samples] }.inject({}){|h, (k, v)| h[k] = v; h}
+      @data[:"sorted_frames_#{sort_by_total}"] ||=
+        @data[:frames].sort_by{ |iseq, stats| -stats[sort_by_total ? :total_samples : :samples] }.inject({}){|h, (k, v)| h[k] = v; h}
     end
 
     # normalized frames is used when we want to combine multiple
@@ -72,8 +73,8 @@ module StackProf
 
     def add_lines(a, b)
       return b if a.nil?
-      return a+b if a.is_a? Fixnum
-      return [ a[0], a[1]+b ] if b.is_a? Fixnum
+      return a+b if a.is_a? Integer
+      return [ a[0], a[1]+b ] if b.is_a? Integer
       [ a[0]+b[0], a[1]+b[1] ]
     end
 
@@ -83,6 +84,11 @@ module StackProf
 
     def print_dump(f=STDOUT)
       f.puts Marshal.dump(@data.reject{|k,v| k == :files })
+    end
+
+    def print_json(f=STDOUT)
+      require "json"
+      f.puts JSON.generate(@data)
     end
 
     def print_stackcollapse
@@ -227,7 +233,7 @@ module StackProf
       f.puts "}"
     end
 
-    def print_text(sort_by_total=false, limit=nil, f = STDOUT)
+    def print_text(sort_by_total=false, limit=nil, select_files= nil, reject_files=nil, select_names=nil, reject_names=nil, f = STDOUT)
       f.puts "=================================="
       f.printf "  Mode: #{modeline}\n"
       f.printf "  Samples: #{@data[:samples]} (%.2f%% miss rate)\n", 100.0*@data[:missed_samples]/(@data[:missed_samples]+@data[:samples])
@@ -235,6 +241,10 @@ module StackProf
       f.puts "=================================="
       f.printf "% 10s    (pct)  % 10s    (pct)     FRAME\n" % ["TOTAL", "SAMPLES"]
       list = frames(sort_by_total)
+      list.select!{|_, info| select_files.any?{|path| info[:file].start_with?(path)}} if select_files
+      list.select!{|_, info| select_names.any?{|reg| info[:name] =~ reg}} if select_names
+      list.reject!{|_, info| reject_files.any?{|path| info[:file].start_with?(path)}} if reject_files
+      list.reject!{|_, info| reject_names.any?{|reg| info[:name] =~ reg}} if reject_names
       list = list.first(limit) if limit
       list.each do |frame, info|
         call, total = info.values_at(:samples, :total_samples)
@@ -303,6 +313,47 @@ module StackProf
 
         f.puts "  code:"
         source_display(f, file, lines, line-1..maxline)
+      end
+    end
+
+    # Walk up and down the stack from a given starting point (name).  Loops
+    # until `:exit` is selected
+    def walk_method(name)
+      method_choice  = /#{Regexp.escape name}/
+      invalid_choice = false
+
+      # Continue walking up and down the stack until the users selects "exit"
+      while method_choice != :exit
+        print_method method_choice unless invalid_choice
+        STDOUT.puts "\n\n"
+
+        # Determine callers and callees for the current frame
+        new_frames  = frames.select  {|_, info| info[:name] =~ method_choice }
+        new_choices = new_frames.map {|frame, info| [
+          callers_for(frame).sort_by(&:last).reverse.map(&:first),
+          (info[:edges] || []).map{ |k, w| [data[:frames][k][:name], w] }.sort_by{ |k,v| -v }.map(&:first)
+        ]}.flatten + [:exit]
+
+        # Print callers and callees for selection
+        STDOUT.puts "Select next method:"
+        new_choices.each_with_index do |method, index|
+          STDOUT.printf "%2d)  %s\n", index + 1, method.to_s
+        end
+
+        # Pick selection
+        STDOUT.printf "> "
+        selection = STDIN.gets.chomp.to_i - 1
+        STDOUT.puts "\n\n\n"
+
+        # Determine if it was a valid choice
+        # (if not, don't re-run .print_method)
+        if new_choice = new_choices[selection]
+          invalid_choice = false
+          method_choice = new_choice == :exit ? :exit : %r/^#{Regexp.escape new_choice}$/
+        else
+          invalid_choice = true
+          STDOUT.puts "Invalid choice.  Please select again..."
+        end
       end
     end
 

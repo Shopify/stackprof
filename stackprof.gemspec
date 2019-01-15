@@ -1,13 +1,13 @@
 Gem::Specification.new do |s|
   s.name = 'stackprof'
-  s.version = '0.2.9'
+  s.version = '0.2.12'
   s.homepage = 'http://github.com/tmm1/stackprof'
 
   s.authors = 'Aman Gupta'
   s.email   = 'aman@tmm1.net'
 
   s.files = `git ls-files`.split("\n")
-  s.extensions = 'ext/extconf.rb'
+  s.extensions = 'ext/stackprof/extconf.rb'
 
   s.bindir = 'bin'
   s.executables << 'stackprof'

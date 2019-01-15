@@ -2,11 +2,12 @@ $:.unshift File.expand_path('../../lib', __FILE__)
 require 'stackprof'
 require 'minitest/autorun'
 require 'tempfile'
+require 'pathname'
 
 class StackProfTest < MiniTest::Test
   def test_info
     profile = StackProf.run{}
-    assert_equal 1.1, profile[:version]
+    assert_equal 1.2, profile[:version]
     assert_equal :wall, profile[:mode]
     assert_equal 1000, profile[:interval]
     assert_equal 0, profile[:samples]
@@ -18,16 +19,16 @@ class StackProfTest < MiniTest::Test
   end
 
   def test_start_stop_results
-    assert_equal nil, StackProf.results
+    assert_nil StackProf.results
     assert_equal true, StackProf.start
     assert_equal false, StackProf.start
     assert_equal true, StackProf.running?
-    assert_equal nil, StackProf.results
+    assert_nil StackProf.results
     assert_equal true, StackProf.stop
     assert_equal false, StackProf.stop
     assert_equal false, StackProf.running?
     assert_kind_of Hash, StackProf.results
-    assert_equal nil, StackProf.results
+    assert_nil StackProf.results
   end
 
   def test_object_allocation
@@ -41,13 +42,12 @@ class StackProfTest < MiniTest::Test
     assert_equal 2, profile[:samples]
 
     frame = profile[:frames].values.first
-    assert_equal "block in StackProfTest#test_object_allocation", frame[:name]
+    assert_includes frame[:name], "StackProfTest#test_object_allocation"
     assert_equal 2, frame[:samples]
-    assert_equal profile_base_line, frame[:line]
+    assert_includes [profile_base_line - 2, profile_base_line], frame[:line]
     assert_equal [1, 1], frame[:lines][profile_base_line+1]
     assert_equal [1, 1], frame[:lines][profile_base_line+2]
-
-    frame = profile[:frames].values[1]
+    frame = profile[:frames].values[1] if RUBY_VERSION < '2.3'
     assert_equal [2, 0], frame[:lines][profile_base_line]
   end
 
@@ -71,9 +71,9 @@ class StackProfTest < MiniTest::Test
       math
     end
 
-    assert_operator profile[:samples], :>, 1
+    assert_operator profile[:samples], :>=, 1
     frame = profile[:frames].values.first
-    assert_equal "block in StackProfTest#math", frame[:name]
+    assert_includes frame[:name], "StackProfTest#math"
   end
 
   def test_walltime
@@ -83,7 +83,7 @@ class StackProfTest < MiniTest::Test
 
     frame = profile[:frames].values.first
     assert_equal "StackProfTest#idle", frame[:name]
-    assert_in_delta 200, frame[:samples], 5
+    assert_in_delta 200, frame[:samples], 25
   end
 
   def test_custom
@@ -98,8 +98,8 @@ class StackProfTest < MiniTest::Test
     assert_equal 10, profile[:samples]
 
     frame = profile[:frames].values.first
-    assert_equal "block (2 levels) in StackProfTest#test_custom", frame[:name]
-    assert_equal profile_base_line+1, frame[:line]
+    assert_includes frame[:name], "StackProfTest#test_custom"
+    assert_includes [profile_base_line-2, profile_base_line+1], frame[:line]
     assert_equal [10, 10], frame[:lines][profile_base_line+2]
   end
 
@@ -113,7 +113,8 @@ class StackProfTest < MiniTest::Test
     raw = profile[:raw]
     assert_equal 10, raw[-1]
     assert_equal raw[0] + 2, raw.size
-    assert_equal 'block (2 levels) in StackProfTest#test_raw', profile[:frames][raw[-2]][:name]
+    assert_includes profile[:frames][raw[-2]][:name], 'StackProfTest#test_raw'
+    assert_equal 10, profile[:raw_timestamp_deltas].size
   end
 
   def test_fork
@@ -127,16 +128,40 @@ class StackProfTest < MiniTest::Test
     end
   end
 
+  def foo(n = 10)
+    if n == 0
+      StackProf.sample
+      return
+    end
+    foo(n - 1)
+  end
+
+  def test_recursive_total_samples
+    profile = StackProf.run(mode: :cpu, raw: true) do
+      10.times do
+        foo
+      end
+    end
+
+    frame = profile[:frames].values.find do |frame|
+      frame[:name] == "StackProfTest#foo"
+    end
+    assert_equal 10, frame[:total_samples]
+  end
+
   def test_gc
-    profile = StackProf.run(interval: 100) do
+    profile = StackProf.run(interval: 100, raw: true) do
       5.times do
         GC.start
       end
     end
 
-    assert_empty profile[:frames]
+    raw = profile[:raw]
+    gc_frame = profile[:frames].values.find{ |f| f[:name] == "(garbage collection)" }
+    assert gc_frame
+    assert_equal gc_frame[:samples], profile[:gc_samples]
     assert_operator profile[:gc_samples], :>, 0
-    assert_equal 0, profile[:missed_samples]
+    assert_operator profile[:missed_samples], :<=, 10
   end
 
   def test_out
@@ -146,6 +171,32 @@ class StackProfTest < MiniTest::Test
     end
 
     assert_equal tmpfile, ret
+    tmpfile.rewind
+    profile = Marshal.load(tmpfile.read)
+    refute_empty profile[:frames]
+  end
+
+  def test_out_to_path_string
+    tmpfile = Tempfile.new('stackprof-out')
+    ret = StackProf.run(mode: :custom, out: tmpfile.path) do
+      StackProf.sample
+    end
+
+    refute_equal tmpfile, ret
+    assert_equal tmpfile.path, ret.path
+    tmpfile.rewind
+    profile = Marshal.load(tmpfile.read)
+    refute_empty profile[:frames]
+  end
+
+  def test_pathname_out
+    tmpfile  = Tempfile.new('stackprof-out')
+    pathname = Pathname.new(tmpfile.path)
+    ret = StackProf.run(mode: :custom, out: pathname) do
+      StackProf.sample
+    end
+
+    assert_equal tmpfile.path, ret.path
     tmpfile.rewind
     profile = Marshal.load(tmpfile.read)
     refute_empty profile[:frames]
