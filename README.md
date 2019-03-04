@@ -1,13 +1,17 @@
-## stackprof
+# Stackprof
 
-a sampling call-stack profiler for ruby 2.1+
+A sampling call-stack profiler for Ruby.
 
-inspired heavily by [gperftools](https://code.google.com/p/gperftools/),
-and written as a replacement for [perftools.rb](https://github.com/tmm1/perftools.rb)
+Inspired heavily by [gperftools](https://code.google.com/p/gperftools/), and written as a replacement for [perftools.rb](https://github.com/tmm1/perftools.rb).
 
-### getting started
+## Requirements
 
-#### Install
+* Ruby 2.1+
+* Linux-based OS
+
+## Getting Started
+
+### Install
 
 In your Gemfile add:
 
@@ -18,13 +22,13 @@ gem 'stackprof'
 Then run `$ bundle install`. Alternatively you can run `$ gem install stackprof`.
 
 
-#### Run
+### Run
 
 in ruby:
 
 ``` ruby
 StackProf.run(mode: :cpu, out: 'tmp/stackprof-cpu-myapp.dump') do
-  ...
+  #...
 end
 ```
 
@@ -77,7 +81,23 @@ $ stackprof tmp/stackprof-cpu-*.dump --method 'Object#present?'
 
 For an experimental version of WebUI reporting of stackprof, see [stackprof-webnav](https://github.com/alisnic/stackprof-webnav)
 
-### sampling
+You can generate a flamegraph however additional data must be collected using the `raw: true` flag. Once you've collected results with this flag enabled you can generate a flamegraph:
+
+```
+$ stackprof --flamegraph tmp/stackprof-cpu-myapp.dump > tmp/flamegraph
+```
+
+Once the flamegraph has been generated you can generate a viewer command with:
+
+```
+$ stackprof --flamegraph-viewer=tmp/flamegraph
+```
+
+The `--flamegraph-viewer` command will output the exact shell command you need to run to open the `tmp/flamegraph` you generated with the built in stackprof flamegraph viewer:
+
+![](http://i.imgur.com/EwndrgD.png)
+
+## Sampling
 
 four sampling modes are supported:
 
@@ -89,8 +109,29 @@ four sampling modes are supported:
 samplers have a tuneable interval which can be used to reduce overhead or increase granularity:
 
   - wall time: sample every _interval_ microseconds of wallclock time (default: 1000)
+
+```ruby
+StackProf.run(mode: :wall, out: 'tmp/stackprof.dump', interval: 1000) do
+  #...
+end
+```
+
   - cpu time: sample every _interval_ microseconds of cpu activity (default: 1000 = 1 millisecond)
+
+```ruby
+StackProf.run(mode: :cpu, out: 'tmp/stackprof.dump', interval: 1000) do
+  #...
+end
+```
+
   - object allocation: sample every _interval_ allocations (default: 1)
+
+
+```ruby
+StackProf.run(mode: :object, out: 'tmp/stackprof.dump', interval: 1) do
+  #...
+end
+```
 
 samples are taken using a combination of three new C-APIs in ruby 2.1:
 
@@ -105,7 +146,7 @@ samples are taken using a combination of three new C-APIs in ruby 2.1:
   - in allocation mode, samples are taken via `rb_tracepoint_new(RUBY_INTERNAL_EVENT_NEWOBJ)`,
     which provides a notification every time the VM allocates a new object.
 
-### aggregation
+## Aggregation
 
 each sample consists of N stack frames, where a frame looks something like `MyClass#method` or `block in MySingleton.method`.
 for each of these frames in the sample, the profiler collects a few pieces of metadata:
@@ -138,14 +179,14 @@ this technique builds up an incremental callgraph from the samples. on any given
 the sum of the outbound edge weights is equal to total samples collected on that frame
 (`frame.total_samples == frame.edges.values.sum`).
 
-### reporting
+## Reporting
 
 multiple reporting modes are supported:
   - text
   - dotgraph
   - source annotation
 
-#### `StackProf::Report.new(data).print_text`
+### `StackProf::Report.new(data).print_text`
 
 ```
      TOTAL    (pct)     SAMPLES    (pct)     FRAME
@@ -160,7 +201,7 @@ multiple reporting modes are supported:
        188 (100.0%)           0   (0.0%)     <main>
 ```
 
-#### `StackProf::Report.new(data).print_graphviz`
+### `StackProf::Report.new(data).print_graphviz`
 
 ![](http://cl.ly/image/2t3l2q0l0B0A/content)
 
@@ -186,7 +227,7 @@ digraph profile {
 }
 ```
 
-#### `StackProf::Report.new(data).print_method(/pow|newobj|math/)`
+### `StackProf::Report.new(data).print_method(/pow|newobj|math/)`
 
 ```
 A#pow (/Users/tmm1/code/stackprof/sample.rb:11)
@@ -208,7 +249,7 @@ block in A#math (/Users/tmm1/code/stackprof/sample.rb:21)
                          |    23  |     end
 ```
 
-### usage
+## Usage
 
 the profiler is compiled as a C-extension and exposes a simple api: `StackProf.run(mode: [:cpu|:wall|:object])`.
 the `run` method takes a block of code and returns a profile as a simple hash.
@@ -258,7 +299,7 @@ above, `A#pow` was involved in 91 samples, and in all cases it was at the top of
 divided up between its callee edges. all 91 calls to `A#pow` came from `A#initialize`, as seen by the edge numbered
 `70346498324780`.
 
-### advanced usage
+## Advanced usage
 
 the profiler can be started and stopped manually. results are accumulated until retrieval, across
 multiple start/stop invocations.
@@ -270,7 +311,7 @@ StackProf.stop
 StackProf.results('/tmp/some.file')
 ```
 
-### all options
+## All options
 
 `StackProf.run` accepts an options hash. Currently, the following options are recognized:
 
@@ -281,8 +322,9 @@ Option      | Meaning
 `interval`  | mode-relative sample rate [c.f.](#sampling)
 `aggregate` | defaults: `true` - if `false` disables [aggregation](#aggregation)
 `raw`       | defaults `false` - if `true` collects the extra data required by the `--flamegraph` and `--stackcollapse` report types
+`save_every`| (rack middleware only) write the target file after this many requests
 
-### todo
+## Todo
 
 * file/iseq blacklist
 * restore signal handlers on stop

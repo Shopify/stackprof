@@ -20,6 +20,7 @@
 typedef struct {
     size_t total_samples;
     size_t caller_samples;
+    size_t seen_at_sample_number;
     st_table *edges;
     st_table *lines;
 } frame_data_t;
@@ -38,19 +39,28 @@ static struct {
     size_t raw_samples_capa;
     size_t raw_sample_index;
 
+    struct timeval last_sample_at;
+    int *raw_timestamp_deltas;
+    size_t raw_timestamp_deltas_len;
+    size_t raw_timestamp_deltas_capa;
+
     size_t overall_signals;
     size_t overall_samples;
     size_t newobj_signals;
     size_t during_gc;
+    size_t unrecorded_gc_samples;
     st_table *frames;
 
+    VALUE fake_gc_frame;
+    VALUE fake_gc_frame_name;
+    VALUE empty_string;
     VALUE frames_buffer[BUF_SIZE];
     int lines_buffer[BUF_SIZE];
 } _stackprof;
 
 static VALUE sym_object, sym_wall, sym_cpu, sym_custom, sym_name, sym_file, sym_line;
 static VALUE sym_samples, sym_total_samples, sym_missed_samples, sym_edges, sym_lines;
-static VALUE sym_version, sym_mode, sym_interval, sym_raw, sym_frames, sym_out, sym_aggregate;
+static VALUE sym_version, sym_mode, sym_interval, sym_raw, sym_frames, sym_out, sym_aggregate, sym_raw_timestamp_deltas;
 static VALUE sym_gc_samples, objtracer;
 static VALUE gc_hook;
 static VALUE rb_mStackProf;
@@ -122,6 +132,10 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     _stackprof.interval = interval;
     _stackprof.out = out;
 
+    if (raw) {
+	gettimeofday(&_stackprof.last_sample_at, NULL);
+    }
+
     return Qtrue;
 }
 
@@ -189,16 +203,24 @@ frame_i(st_data_t key, st_data_t val, st_data_t arg)
 
     rb_hash_aset(results, rb_obj_id(frame), details);
 
-    name = rb_profile_frame_full_label(frame);
+    if (frame == _stackprof.fake_gc_frame) {
+	name = _stackprof.fake_gc_frame_name;
+	file = _stackprof.empty_string;
+	line = INT2FIX(0);
+    } else {
+	name = rb_profile_frame_full_label(frame);
+
+	file = rb_profile_frame_absolute_path(frame);
+	if (NIL_P(file))
+	    file = rb_profile_frame_path(frame);
+	line = rb_profile_frame_first_lineno(frame);
+    }
+
     rb_hash_aset(details, sym_name, name);
-
-    file = rb_profile_frame_absolute_path(frame);
-    if (NIL_P(file))
-	file = rb_profile_frame_path(frame);
     rb_hash_aset(details, sym_file, file);
-
-    if ((line = rb_profile_frame_first_lineno(frame)) != INT2FIX(0))
+    if (line != INT2FIX(0)) {
 	rb_hash_aset(details, sym_line, line);
+    }
 
     rb_hash_aset(details, sym_total_samples, SIZET2NUM(frame_data->total_samples));
     rb_hash_aset(details, sym_samples, SIZET2NUM(frame_data->caller_samples));
@@ -232,7 +254,7 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 	return Qnil;
 
     results = rb_hash_new();
-    rb_hash_aset(results, sym_version, DBL2NUM(1.1));
+    rb_hash_aset(results, sym_version, DBL2NUM(1.2));
     rb_hash_aset(results, sym_mode, _stackprof.mode);
     rb_hash_aset(results, sym_interval, _stackprof.interval);
     rb_hash_aset(results, sym_samples, SIZET2NUM(_stackprof.overall_samples));
@@ -248,6 +270,7 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 
     if (_stackprof.raw && _stackprof.raw_samples_len) {
 	size_t len, n, o;
+	VALUE raw_timestamp_deltas;
 	VALUE raw_samples = rb_ary_new_capa(_stackprof.raw_samples_len);
 
 	for (n = 0; n < _stackprof.raw_samples_len; n++) {
@@ -264,9 +287,23 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 	_stackprof.raw_samples_len = 0;
 	_stackprof.raw_samples_capa = 0;
 	_stackprof.raw_sample_index = 0;
-	_stackprof.raw = 0;
 
 	rb_hash_aset(results, sym_raw, raw_samples);
+
+	raw_timestamp_deltas = rb_ary_new_capa(_stackprof.raw_timestamp_deltas_len);
+
+	for (n = 0; n < _stackprof.raw_timestamp_deltas_len; n++) {
+	    rb_ary_push(raw_timestamp_deltas, INT2FIX(_stackprof.raw_timestamp_deltas[n]));
+	}
+
+	free(_stackprof.raw_timestamp_deltas);
+	_stackprof.raw_timestamp_deltas = NULL;
+	_stackprof.raw_timestamp_deltas_len = 0;
+	_stackprof.raw_timestamp_deltas_capa = 0;
+
+	rb_hash_aset(results, sym_raw_timestamp_deltas, raw_timestamp_deltas);
+
+	_stackprof.raw = 0;
     }
 
     if (argc == 1)
@@ -274,11 +311,12 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 
     if (RTEST(_stackprof.out)) {
 	VALUE file;
-	if (RB_TYPE_P(_stackprof.out, T_STRING)) {
-	    file = rb_file_open_str(_stackprof.out, "w");
-	} else {
+	if (rb_respond_to(_stackprof.out, rb_intern("to_io"))) {
 	    file = rb_io_check_io(_stackprof.out);
+	} else {
+	    file = rb_file_open_str(_stackprof.out, "w");
 	}
+
 	rb_marshal_dump(results, file);
 	rb_io_flush(file);
 	_stackprof.out = Qnil;
@@ -342,28 +380,39 @@ st_numtable_increment(st_table *table, st_data_t key, size_t increment)
 }
 
 void
-stackprof_record_sample()
+stackprof_record_sample_for_stack(int num, int timestamp_delta)
 {
-    int num, i, n;
+    int i, n;
     VALUE prev_frame = Qnil;
 
     _stackprof.overall_samples++;
-    num = rb_profile_frames(0, sizeof(_stackprof.frames_buffer) / sizeof(VALUE), _stackprof.frames_buffer, _stackprof.lines_buffer);
 
     if (_stackprof.raw) {
 	int found = 0;
 
+	/* If there's no sample buffer allocated, then allocate one.  The buffer
+	 * format is the number of frames (num), then the list of frames (from
+	 * `_stackprof.raw_samples`), followed by the number of times this
+	 * particular stack has been seen in a row.  Each "new" stack is added
+	 * to the end of the buffer, but if the previous stack is the same as
+	 * the current stack, the counter will be incremented. */
 	if (!_stackprof.raw_samples) {
 	    _stackprof.raw_samples_capa = num * 100;
 	    _stackprof.raw_samples = malloc(sizeof(VALUE) * _stackprof.raw_samples_capa);
 	}
 
-	if (_stackprof.raw_samples_capa <= _stackprof.raw_samples_len + num) {
+	/* If we can't fit all the samples in the buffer, double the buffer size. */
+	while (_stackprof.raw_samples_capa <= _stackprof.raw_samples_len + (num + 2)) {
 	    _stackprof.raw_samples_capa *= 2;
 	    _stackprof.raw_samples = realloc(_stackprof.raw_samples, sizeof(VALUE) * _stackprof.raw_samples_capa);
 	}
 
+	/* If we've seen this stack before in the last sample, then increment the "seen" count. */
 	if (_stackprof.raw_samples_len > 0 && _stackprof.raw_samples[_stackprof.raw_sample_index] == (VALUE)num) {
+	    /* The number of samples could have been the same, but the stack
+	     * might be different, so we need to check the stack here.  Stacks
+	     * in the raw buffer are stored in the opposite direction of stacks
+	     * in the frames buffer that came from Ruby. */
 	    for (i = num-1, n = 0; i >= 0; i--, n++) {
 		VALUE frame = _stackprof.frames_buffer[i];
 		if (_stackprof.raw_samples[_stackprof.raw_sample_index + 1 + n] != frame)
@@ -375,7 +424,11 @@ stackprof_record_sample()
 	    }
 	}
 
+	/* If we haven't seen the stack, then add it to the buffer along with
+	 * the length of the stack and a 1 for the "seen" count */
 	if (!found) {
+	    /* Bump the `raw_sample_index` up so that the next iteration can
+	     * find the previously recorded stack size. */
 	    _stackprof.raw_sample_index = _stackprof.raw_samples_len;
 	    _stackprof.raw_samples[_stackprof.raw_samples_len++] = (VALUE)num;
 	    for (i = num-1; i >= 0; i--) {
@@ -384,6 +437,22 @@ stackprof_record_sample()
 	    }
 	    _stackprof.raw_samples[_stackprof.raw_samples_len++] = (VALUE)1;
 	}
+
+	/* If there's no timestamp delta buffer, allocate one */
+	if (!_stackprof.raw_timestamp_deltas) {
+	    _stackprof.raw_timestamp_deltas_capa = 100;
+	    _stackprof.raw_timestamp_deltas = malloc(sizeof(int) * _stackprof.raw_timestamp_deltas_capa);
+	    _stackprof.raw_timestamp_deltas_len = 0;
+	}
+
+	/* Double the buffer size if it's too small */
+	while (_stackprof.raw_timestamp_deltas_capa <= _stackprof.raw_timestamp_deltas_len + 1) {
+	    _stackprof.raw_timestamp_deltas_capa *= 2;
+	    _stackprof.raw_timestamp_deltas = realloc(_stackprof.raw_timestamp_deltas, sizeof(int) * _stackprof.raw_timestamp_deltas_capa);
+	}
+
+	/* Store the time delta (which is the amount of time between samples) */
+	_stackprof.raw_timestamp_deltas[_stackprof.raw_timestamp_deltas_len++] = timestamp_delta;
     }
 
     for (i = 0; i < num; i++) {
@@ -391,7 +460,10 @@ stackprof_record_sample()
 	VALUE frame = _stackprof.frames_buffer[i];
 	frame_data_t *frame_data = sample_for(frame);
 
-	frame_data->total_samples++;
+	if (frame_data->seen_at_sample_number != _stackprof.overall_samples) {
+	    frame_data->total_samples++;
+	}
+	frame_data->seen_at_sample_number = _stackprof.overall_samples;
 
 	if (i == 0) {
 	    frame_data->caller_samples++;
@@ -402,15 +474,77 @@ stackprof_record_sample()
 	}
 
 	if (_stackprof.aggregate && line > 0) {
-	    if (!frame_data->lines)
-		frame_data->lines = st_init_numtable();
 	    size_t half = (size_t)1<<(8*SIZEOF_SIZE_T/2);
 	    size_t increment = i == 0 ? half + 1 : half;
+	    if (!frame_data->lines)
+		frame_data->lines = st_init_numtable();
 	    st_numtable_increment(frame_data->lines, (st_data_t)line, increment);
 	}
 
 	prev_frame = frame;
     }
+
+    if (_stackprof.raw) {
+	gettimeofday(&_stackprof.last_sample_at, NULL);
+    }
+}
+
+void
+stackprof_record_sample()
+{
+    int timestamp_delta = 0;
+    int num;
+    if (_stackprof.raw) {
+	struct timeval t;
+	struct timeval diff;
+	gettimeofday(&t, NULL);
+	timersub(&t, &_stackprof.last_sample_at, &diff);
+	timestamp_delta = (1000 * diff.tv_sec) + diff.tv_usec;
+    }
+    num = rb_profile_frames(0, sizeof(_stackprof.frames_buffer) / sizeof(VALUE), _stackprof.frames_buffer, _stackprof.lines_buffer);
+    stackprof_record_sample_for_stack(num, timestamp_delta);
+}
+
+void
+stackprof_record_gc_samples()
+{
+    int delta_to_first_unrecorded_gc_sample = 0;
+    int i;
+    if (_stackprof.raw) {
+	struct timeval t;
+	struct timeval diff;
+	gettimeofday(&t, NULL);
+	timersub(&t, &_stackprof.last_sample_at, &diff);
+
+	// We don't know when the GC samples were actually marked, so let's
+	// assume that they were marked at a perfectly regular interval.
+	delta_to_first_unrecorded_gc_sample = (1000 * diff.tv_sec + diff.tv_usec) - (_stackprof.unrecorded_gc_samples - 1) * _stackprof.interval;
+	if (delta_to_first_unrecorded_gc_sample < 0) {
+	    delta_to_first_unrecorded_gc_sample = 0;
+	}
+    }
+
+    _stackprof.frames_buffer[0] = _stackprof.fake_gc_frame;
+    _stackprof.lines_buffer[0] = 0;
+
+    for (i = 0; i < _stackprof.unrecorded_gc_samples; i++) {
+	int timestamp_delta = i == 0 ? delta_to_first_unrecorded_gc_sample : _stackprof.interval;
+	stackprof_record_sample_for_stack(1, timestamp_delta);
+    }
+    _stackprof.during_gc += _stackprof.unrecorded_gc_samples;
+    _stackprof.unrecorded_gc_samples = 0;
+}
+
+static void
+stackprof_gc_job_handler(void *data)
+{
+    static int in_signal_handler = 0;
+    if (in_signal_handler) return;
+    if (!_stackprof.running) return;
+
+    in_signal_handler++;
+    stackprof_record_gc_samples();
+    in_signal_handler--;
 }
 
 static void
@@ -429,10 +563,12 @@ static void
 stackprof_signal_handler(int sig, siginfo_t *sinfo, void *ucontext)
 {
     _stackprof.overall_signals++;
-    if (rb_during_gc())
-	_stackprof.during_gc++, _stackprof.overall_samples++;
-    else
-	rb_postponed_job_register_one(0, stackprof_job_handler, 0);
+    if (rb_during_gc()) {
+	_stackprof.unrecorded_gc_samples++;
+	rb_postponed_job_register_one(0, stackprof_gc_job_handler, (void*)0);
+    } else {
+	rb_postponed_job_register_one(0, stackprof_job_handler, (void*)0);
+    }
 }
 
 static void
@@ -527,6 +663,7 @@ Init_stackprof(void)
     S(mode);
     S(interval);
     S(raw);
+    S(raw_timestamp_deltas);
     S(out);
     S(frames);
     S(aggregate);
@@ -535,6 +672,21 @@ Init_stackprof(void)
     gc_hook = Data_Wrap_Struct(rb_cObject, stackprof_gc_mark, NULL, &_stackprof);
     rb_global_variable(&gc_hook);
 
+    _stackprof.raw_samples = NULL;
+    _stackprof.raw_samples_len = 0;
+    _stackprof.raw_samples_capa = 0;
+    _stackprof.raw_sample_index = 0;
+
+    _stackprof.raw_timestamp_deltas = NULL;
+    _stackprof.raw_timestamp_deltas_len = 0;
+    _stackprof.raw_timestamp_deltas_capa = 0;
+
+    _stackprof.fake_gc_frame = INT2FIX(0x9C);
+    _stackprof.empty_string = rb_str_new_cstr("");
+    _stackprof.fake_gc_frame_name = rb_str_new_cstr("(garbage collection)");
+    rb_global_variable(&_stackprof.fake_gc_frame_name);
+    rb_global_variable(&_stackprof.empty_string);
+
     rb_mStackProf = rb_define_module("StackProf");
     rb_define_singleton_method(rb_mStackProf, "running?", stackprof_running_p, 0);
     rb_define_singleton_method(rb_mStackProf, "run", stackprof_run, -1);
@@ -542,9 +694,6 @@ Init_stackprof(void)
     rb_define_singleton_method(rb_mStackProf, "stop", stackprof_stop, 0);
     rb_define_singleton_method(rb_mStackProf, "results", stackprof_results, -1);
     rb_define_singleton_method(rb_mStackProf, "sample", stackprof_sample, 0);
-
-    rb_autoload(rb_mStackProf, rb_intern_const("Report"), "stackprof/report.rb");
-    rb_autoload(rb_mStackProf, rb_intern_const("Middleware"), "stackprof/middleware.rb");
 
     pthread_atfork(stackprof_atfork_prepare, stackprof_atfork_parent, stackprof_atfork_child);
 }
